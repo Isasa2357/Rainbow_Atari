@@ -52,15 +52,19 @@ def main():
         # env
         'env_name': "ALE/Breakout-v5", 
         # hyper param
-        'episodes': 100, 
+        'episodes': 10000, 
         'gamma': 0.995, 
         'lr': 1e-4, 
         'tau': 1e-3, 
+        'epsilon_init': 1.0, 
+        'epsilon_dest': 1e-3, 
+        'epsilon_dcayRate': 0.999, 
+        'warmup_episode': 2, 
         # qnet
         'frame_num': 4, 
         # replayBuf
-        'capacity': 1000000, 
-        'batch_size': 128, 
+        'capacity': 100000, 
+        'batch_size': 16, 
         # device
         'device': 'cpu',
         # result
@@ -74,6 +78,8 @@ def main():
     gamma = makeConstant(args['gamma'], device)
     lr = makeConstant(args['lr'], device)
     tau = makeConstant(args['tau'], device)
+    epsilon = makeMultiply(args['epsilon_init'], args['epsilon_dcayRate'], args['epsilon_dest'], args['epsilon_init'], device)
+    warmup_episode = args['warmup_episode']
     frame_num = args['frame_num']
     capacity = args['capacity']
     batch_size = args['batch_size']
@@ -81,45 +87,53 @@ def main():
     result = args['result']
 
     env = AutoFireBreakout()
-    state_size, action_kinds, action_size, clearScoreThreshold = get_gymInfo(env_name)
+    state_size, action_size, action_kinds, clearScoreThreshold = get_gymInfo(env_name)
 
-    qnet = AtariNoisyQnetwork(state_size, frame_num, action_kinds, dueling=True)
-    target_qnet = deepcopy(qnet)
-    target_qnet.dueling = False
+    qnet = AtariNoisyQnetwork(state_size, frame_num, action_kinds, dueling=True, do_noiseReset=True)
+    target_qnet = AtariNoisyQnetwork(state_size, frame_num, action_kinds, dueling=True, do_noiseReset=False)
 
     replayBuf = UniformDistributedReplayBuffer(
         capacity, 
         state_size, action_size, 
-        state_type=torch.int8, action_type=torch.int8, 
+        state_type=torch.float, action_type=torch.int, 
         device=device
     )
 
     agent = RainbowAgent(
-        gamma, lr, tau, 
+        gamma, lr, tau, epsilon, 
         state_size, action_size, action_kinds, 
         qnet, target_qnet, 
         'MSELoss', 'Adam', 1, 
         replayBuf=replayBuf, batch_size=batch_size, 
     )
 
-    afpp = AtariFramePreprocesser(4, (84, 84), device)
+    afpp = AtariFramePreprocesser(frame_num, (84, 84), device)
 
     # wormup
     # wormup_worker(env, action_kinds, afpp)
-    episode_observations = concurrent.process_map(wormup_worker, repeat(env, 500), repeat(action_kinds, 500), repeat(afpp, 500), max_workers=10)
+    print('warmup')
+    episode_observations = concurrent.process_map(wormup_worker, repeat(env, warmup_episode), repeat(action_kinds, warmup_episode), repeat(afpp, warmup_episode), max_workers=10)
+    print('add warmup observation to buffer')
+    for observations in tqdm(episode_observations, ncols=80):
+        for observation in observations:
+            agent.add_buffer(*observation)
+    env = AutoFireBreakout(human_render=True)
 
     # loop
     reward_history = list()
-    for episode in range(episodes):
+    for episode in tqdm(range(episodes), ncols=80):
         state, _ = env.reset()
         state = afpp.preprocessing(np.expand_dims(state, axis=0))
         done = False
         total_reward = 0.0
+        action_history = [0 for _ in range(action_kinds)]
 
         while not done:
             # 行動選択
-            action = np.random.choice(range(4))
-            # action = agent.get_action(torch.tensor(state).to(dtype=torch.float))
+            # action = np.random.choice(range(4))
+            action = agent.get_action(torch.tensor(state).to(dtype=torch.float))
+            action = np.array(action).item()
+            action_history[action] += 1
 
             # 実行
             next_state, reward, truncated, terminated, _ = env.step(action)
@@ -128,6 +142,20 @@ def main():
             next_state = afpp.preprocessing(next_state)
 
             # エージェントを更新
+            state = np.array(state)
+            action = np.array(action)
+            reward = np.array(reward)
+            next_state = np.array(next_state)
+            done = np.array(done)
+            agent.update(state, action, reward, next_state, done)
 
             # 後処理
             state = next_state
+            total_reward += reward
+        
+        reward_history.append(total_reward)
+        tqdm.write(f'{episode}: reward={total_reward}')
+        tqdm.write(f'action history: {action_history}')
+        tqdm.write(f'epsilon: {agent._epsilon.value}')
+
+        agent.param_step()
