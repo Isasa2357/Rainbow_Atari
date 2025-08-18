@@ -59,7 +59,7 @@ def main():
         'epsilon_init': 1.0, 
         'epsilon_dest': 1e-3, 
         'epsilon_dcayRate': 0.999, 
-        'warmup_episode': 2, 
+        'warmup_episode': 1000, 
         # qnet
         'frame_num': 4, 
         # replayBuf
